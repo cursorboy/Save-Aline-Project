@@ -67,7 +67,16 @@ class ContentExtractor:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
         })
     
     def extract_from_html(self, html: str, url: str) -> tuple[str, str, str]:
@@ -212,6 +221,23 @@ class BlogScraper:
             post_urls = self._extract_post_urls(html, blog_url)
             logger.info(f"Found {len(post_urls)} potential posts")
             
+            # Show first few URLs found for debugging
+            if post_urls:
+                logger.info("Sample URLs found:")
+                for i, url in enumerate(post_urls[:3]):
+                    logger.info(f"  {i+1}. {url}")
+            
+            # If no post URLs found, try extracting content directly from the page
+            if not post_urls:
+                logger.info("No individual post URLs found, checking if content is embedded on main page...")
+                embedded_posts = self._extract_embedded_posts(html, blog_url)
+                if embedded_posts:
+                    logger.info(f"Found {len(embedded_posts)} embedded posts on the page")
+                    return embedded_posts[:max_posts]
+                else:
+                    logger.info("No embedded content found either")
+                    return []
+            
             post_urls = post_urls[:max_posts]
             
             all_items = []
@@ -227,88 +253,361 @@ class BlogScraper:
             logger.error(f"Error scraping blog index {blog_url}: {e}")
             return []
     
+    def _extract_embedded_posts(self, html: str, base_url: str) -> List[ContentItem]:
+        """Extract blog posts that are embedded directly on the page"""
+        soup = BeautifulSoup(html, 'html.parser')
+        posts = []
+        
+        # Strategy 1: Look for article-like structures
+        article_selectors = [
+            'article',
+            '.post',
+            '.blog-post',
+            '.entry',
+            '[class*="post"]',
+            '[class*="blog"]',
+            '[class*="article"]'
+        ]
+        
+        for selector in article_selectors:
+            articles = soup.select(selector)
+            for article in articles:
+                post = self._extract_post_from_element(article, base_url)
+                if post:
+                    posts.append(post)
+        
+        # Strategy 2: Look for repeating content patterns with headings
+        if not posts:
+            # Find all major headings
+            headings = soup.find_all(['h1', 'h2', 'h3'], string=lambda text: text and len(text.strip()) > 10)
+            
+            for heading in headings:
+                # Skip navigation headings
+                heading_text = heading.get_text().strip()
+                if any(nav_word in heading_text.lower() for nav_word in ['blog', 'menu', 'navigation', 'header']):
+                    continue
+                
+                # Try to extract content following this heading
+                post = self._extract_post_from_heading(heading, base_url)
+                if post:
+                    posts.append(post)
+        
+        # Strategy 3: Look for content sections with substantial text
+        if not posts:
+            # Find divs with substantial text content
+            content_divs = soup.find_all('div')
+            for div in content_divs:
+                text_content = div.get_text().strip()
+                # Look for divs with substantial content (likely blog posts)
+                if (len(text_content) > 200 and 
+                    len(text_content.split()) > 30 and
+                    not any(nav_word in text_content.lower()[:100] for nav_word in ['navigation', 'menu', 'footer', 'header'])):
+                    
+                    # Try to find a title within this div
+                    title_element = div.find(['h1', 'h2', 'h3', 'h4'])
+                    if title_element:
+                        title = title_element.get_text().strip()
+                        if len(title) > 5:  # Reasonable title length
+                            content = markdownify.markdownify(str(div), heading_style="ATX").strip()
+                            if len(content) > 100:
+                                posts.append(ContentItem(
+                                    title=title,
+                                    content=content,
+                                    content_type="blog",
+                                    source_url=base_url,
+                                    author=""
+                                ))
+        
+        return posts
+    
+    def _extract_post_from_element(self, element, base_url: str) -> Optional[ContentItem]:
+        """Extract a blog post from a specific HTML element"""
+        # Find title
+        title_element = element.find(['h1', 'h2', 'h3', 'h4'])
+        if not title_element:
+            return None
+        
+        title = title_element.get_text().strip()
+        if len(title) < 5:  # Too short to be a real title
+            return None
+        
+        # Convert to markdown
+        content = markdownify.markdownify(str(element), heading_style="ATX").strip()
+        
+        # Must have substantial content
+        if len(content) < 100:
+            return None
+        
+        # Try to extract author
+        author = ""
+        author_elements = element.select('.author, .byline, [class*="author"]')
+        if author_elements:
+            author = author_elements[0].get_text().strip()
+        
+        return ContentItem(
+            title=title,
+            content=content,
+            content_type="blog",
+            source_url=base_url,
+            author=author
+        )
+    
+    def _extract_post_from_heading(self, heading, base_url: str) -> Optional[ContentItem]:
+        """Extract a blog post starting from a heading element"""
+        title = heading.get_text().strip()
+        
+        # Collect content following the heading
+        content_elements = []
+        current = heading.next_sibling
+        
+        # Collect content until we hit another major heading or run out
+        while current:
+            if hasattr(current, 'name'):
+                if current.name in ['h1', 'h2', 'h3'] and len(current.get_text().strip()) > 10:
+                    break  # Hit another major heading
+                content_elements.append(current)
+            current = current.next_sibling
+        
+        if not content_elements:
+            return None
+        
+        # Convert collected content to markdown
+        content_html = ''.join(str(elem) for elem in content_elements)
+        content = markdownify.markdownify(content_html, heading_style="ATX").strip()
+        
+        # Must have substantial content
+        if len(content) < 100:
+            return None
+        
+        return ContentItem(
+            title=title,
+            content=f"# {title}\n\n{content}",
+            content_type="blog", 
+            source_url=base_url,
+            author=""
+        )
+    
     def _extract_post_urls(self, html: str, base_url: str) -> List[str]:
         """Extract post URLs from a blog index page"""
         soup = BeautifulSoup(html, 'html.parser')
-        urls = set()
+        urls = []  # Use list to preserve order instead of set
+        seen_urls = set()  # Track duplicates
         
-        link_selectors = [
-            'article a[href]',
-            '.post a[href]',
-            '.entry a[href]',
-            '.blog-post a[href]',
-            'h2 a[href]',
-            'h3 a[href]',
-            '.title a[href]',
-            '.post-title a[href]',
-            '.entry-title a[href]'
+        # Strategy 1: Look for ALL links first in document order
+        all_links = soup.find_all('a', href=True)
+        
+        for link in all_links:
+            href = link.get('href')
+            if href:
+                full_url = urljoin(base_url, href)
+                if full_url not in seen_urls and self._is_likely_post_url(full_url, base_url):
+                    urls.append(full_url)
+                    seen_urls.add(full_url)
+        
+        # Strategy 2: Look specifically in common blog containers
+        blog_containers = [
+            'article', '.post', '.blog-post', '.entry', 
+            '.card', '.grid-item', '.blog-item',
+            '[class*="post"]', '[class*="blog"]', '[class*="article"]',
+            '[class*="card"]', '[class*="grid"]'
         ]
         
-        for selector in link_selectors:
-            for link in soup.select(selector):
+        for container_selector in blog_containers:
+            containers = soup.select(container_selector)
+            for container in containers:
+                container_links = container.find_all('a', href=True)
+                for link in container_links:
+                    href = link.get('href')
+                    if href:
+                        full_url = urljoin(base_url, href)
+                        if full_url not in seen_urls and self._is_likely_post_url(full_url, base_url):
+                            urls.append(full_url)
+                            seen_urls.add(full_url)
+        
+        # Strategy 3: Look for links around headings (titles)
+        headings = soup.find_all(['h1', 'h2', 'h3', 'h4'])
+        for heading in headings:
+            # Check if heading itself is a link
+            if heading.name == 'a' and heading.get('href'):
+                href = heading.get('href')
+                full_url = urljoin(base_url, href)
+                if full_url not in seen_urls and self._is_likely_post_url(full_url, base_url):
+                    urls.append(full_url)
+                    seen_urls.add(full_url)
+            
+            # Check if heading is inside a link
+            parent_link = heading.find_parent('a')
+            if parent_link and parent_link.get('href'):
+                href = parent_link.get('href')
+                full_url = urljoin(base_url, href)
+                if full_url not in seen_urls and self._is_likely_post_url(full_url, base_url):
+                    urls.append(full_url)
+                    seen_urls.add(full_url)
+            
+            # Check for links near the heading
+            for sibling in heading.find_next_siblings(['a'], limit=3):
+                if sibling.get('href'):
+                    href = sibling.get('href')
+                    full_url = urljoin(base_url, href)
+                    if full_url not in seen_urls and self._is_likely_post_url(full_url, base_url):
+                        urls.append(full_url)
+                        seen_urls.add(full_url)
+        
+        # Strategy 4: Look for any div/section that might contain post links
+        content_divs = soup.find_all(['div', 'section'], class_=lambda x: x and any(
+            keyword in str(x).lower() for keyword in ['post', 'blog', 'article', 'content', 'grid', 'card', 'item']
+        ))
+        
+        for div in content_divs:
+            div_links = div.find_all('a', href=True)
+            for link in div_links:
                 href = link.get('href')
                 if href:
                     full_url = urljoin(base_url, href)
-                    if self._is_likely_post_url(full_url, base_url):
-                        urls.add(full_url)
+                    if full_url not in seen_urls and self._is_likely_post_url(full_url, base_url):
+                        urls.append(full_url)
+                        seen_urls.add(full_url)
         
-        if not urls:
-            for link in soup.find_all('a', href=True):
-                href = link.get('href')
-                full_url = urljoin(base_url, href)
-                if self._is_likely_post_url(full_url, base_url):
-                    urls.add(full_url)
-        
-        return list(urls)
+        # Return URLs in the order they were found (no sorting)
+        return urls
     
     def _is_likely_post_url(self, url: str, base_url: str) -> bool:
         """Heuristic to determine if a URL is likely a blog post"""
         parsed_base = urlparse(base_url)
         parsed_url = urlparse(url)
         
+        # Must be same domain
         if parsed_url.netloc != parsed_base.netloc:
             return False
         
         path = parsed_url.path.lower()
         
-        skip_patterns = [
-            '/tag/', '/category/', '/author/', '/page/', '/wp-admin/',
-            '/search/', '/archive/', '/feed/', '/rss/', '/sitemap',
-            '.xml', '.json', '.pdf', '/about', '/contact',
-            '/privacy', '/terms', '/login', '/register'
+        # Skip file extensions
+        if any(ext in path for ext in ['.css', '.js', '.png', '.jpg', '.gif', '.ico', '.xml', '.json']):
+            return False
+        
+        # Skip fragments
+        if url.startswith('#'):
+            return False
+        
+        # Skip obvious admin/system paths
+        if any(admin in path for admin in ['/wp-admin/', '/admin/', '/api/', '/login', '/register']):
+            return False
+        
+        # Skip common navigation pages - be more specific about what to exclude
+        navigation_paths = [
+            '/course', '/book', '/about', '/contact', '/privacy', '/terms', 
+            '/login', '/signup', '/register', '/checkout', '/cart', '/pricing',
+            '/explore', '/tutorial', '/free-tutorial', '/help', '/support'
         ]
         
-        for pattern in skip_patterns:
-            if pattern in path:
+        # Check if this is exactly a navigation path (not a subpath)
+        for nav_path in navigation_paths:
+            if path.rstrip('/') == nav_path or path == nav_path + '/':
                 return False
         
-        post_patterns = [
-            r'/\d{4}/',
-            r'/blog/',
-            r'/post/',
-            r'/article/',
-            r'/\d+/',
-            r'/learn/',
-            r'/guide/'
-        ]
+        # For blog sites, the URL should go deeper than the base
+        base_path = parsed_base.path.rstrip('/')
+        url_path = parsed_url.path.rstrip('/')
         
-        for pattern in post_patterns:
-            if re.search(pattern, path):
-                return True
+        # Must be longer and different from base path
+        if len(url_path) <= len(base_path) or url_path == base_path:
+            return False
         
-        path_segments = [s for s in path.split('/') if s]
-        return (len(path_segments) >= 2 and 
-                not path.endswith(('.css', '.js', '.png', '.jpg', '.gif', '.ico')))
+        # Must have blog indicator OR be significantly deeper
+        has_blog_indicator = '/blog/' in path
+        is_deep_path = len([p for p in path.split('/') if p]) >= 3  # At least 3 path segments
+        
+        # For kennethplay.com/blog/, we want URLs that either:
+        # 1. Have /blog/ in the path AND go deeper
+        # 2. Are deep enough to likely be content
+        if has_blog_indicator and len(url_path) > len(base_path):
+            return True
+        elif is_deep_path and not any(nav in path for nav in navigation_paths):
+            return True
+        
+        return False
     
     async def _fetch_html(self, url: str) -> Optional[str]:
-        """Fetch HTML content"""
+        """Fetch HTML content with Playwright fallback for JS-heavy sites"""
         try:
-            response = self.extractor.session.get(url, timeout=15)
+            response = self.extractor.session.get(url, timeout=20)
             response.raise_for_status()
-            return response.text
             
-        except Exception as e:
+            # Check if we got meaningful content by counting links
+            soup = BeautifulSoup(response.text, 'html.parser')
+            links = soup.find_all('a', href=True)
+            
+            # If very few links, probably JS-heavy site
+            if len(links) <= 10:
+                logger.info(f"Only {len(links)} links found, trying Playwright for better content extraction...")
+                playwright_html = await self._fetch_with_playwright(url)
+                if playwright_html:
+                    return playwright_html
+                else:
+                    logger.info("Playwright failed, using regular HTML")
+                    return response.text
+            
+            if len(response.text) > 500:
+                return response.text
+            else:
+                logger.warning(f"Received very short response from {url}")
+                return response.text
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout fetching {url}")
+            return await self._fetch_with_playwright(url)
+        except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to fetch {url}: {e}")
+            return await self._fetch_with_playwright(url)
+        except Exception as e:
+            logger.warning(f"Unexpected error fetching {url}: {e}")
+            return await self._fetch_with_playwright(url)
+
+    async def _fetch_with_playwright(self, url: str) -> Optional[str]:
+        """Fetch content using Playwright for JS-heavy sites"""
+        try:
+            from playwright.async_api import async_playwright
+            
+            logger.info(f"Using Playwright to render JavaScript content for {url}")
+            
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                
+                # Set a realistic user agent
+                await page.set_extra_http_headers({
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                })
+                
+                # Go to page and wait for network to be idle
+                await page.goto(url, wait_until='networkidle')
+                
+                # Extra wait for any lazy loading or dynamic content
+                await page.wait_for_timeout(3000)
+                
+                # Try to wait for common blog content indicators
+                try:
+                    await page.wait_for_selector('article, .post, .blog-post, h1, h2', timeout=5000)
+                except:
+                    pass  # Continue even if selectors not found
+                
+                content = await page.content()
+                await browser.close()
+                
+                # Verify we got more content than before
+                soup = BeautifulSoup(content, 'html.parser')
+                new_links = soup.find_all('a', href=True)
+                logger.info(f"Playwright found {len(new_links)} links (vs original request)")
+                
+                return content
+                
+        except ImportError:
+            logger.warning("Playwright not installed. For JavaScript-heavy sites, install with: pip install playwright")
+            logger.warning("Continuing with regular HTML extraction...")
+            return None
+        except Exception as e:
+            logger.warning(f"Playwright failed for {url}: {e}")
             return None
 
 class PDFParser:
@@ -428,7 +727,7 @@ class ContentScraper:
     
     def _is_blog_index(self, url: str) -> bool:
         """Determine if URL is a blog index page"""
-        blog_indicators = ['/blog', '/posts', '/articles', '/learn', '/topics']
+        blog_indicators = ['/blog', '/posts', '/articles', '/learn', '/topics', '/resource', '/resources', '/news']
         return any(indicator in url.lower() for indicator in blog_indicators)
     
     def save_output(self, output: ScrapedOutput, filename: str = "scraped_content.json"):
@@ -449,14 +748,14 @@ async def test_coverage_suite():
     
     test_blogs = [
         ("interviewing.io", "https://interviewing.io/blog"),
-        ("quill.co", "https://quill.co/blog"),
         ("nilmamano DSA", "https://nilmamano.com/blog/category/dsa"),
-        ("WordPress blog", "https://ma.tt"),
-        ("Ghost blog", "https://ghost.org/blog"),
-        ("Medium article", "https://medium.com/@dan_abramov"),
-        ("Substack", "https://stratechery.com"),
-        ("Academic blog", "https://blog.research.google"),
-        ("Tech company", "https://blog.cloudflare.com"),
+        ("CSS Tricks", "https://css-tricks.com"),
+        ("Mozilla Hacks", "https://hacks.mozilla.org"),
+        ("WordPress founder", "https://ma.tt"),
+        ("Ghost platform", "https://ghost.org/blog"),
+        ("Netflix Tech", "https://netflixtechblog.com"),
+        ("Cloudflare Blog", "https://blog.cloudflare.com"),
+        ("Shopify Engineering", "https://shopify.engineering/blog"),
     ]
     
     scraper = ContentScraper(team_id="coverage_test")
@@ -520,11 +819,11 @@ async def test_coverage_suite():
     print(f"✓ Detailed results saved to: coverage_test_results.json")
     
     if success_rate >= 0.7:
-        print(f"\n HIGH COVERAGE ACHIEVED ({success_rate:.1%})")
+        print(f"\n🎉 HIGH COVERAGE ACHIEVED ({success_rate:.1%})")
         print("This scraper demonstrates true scalability - it works across")
         print("different blog platforms without requiring custom code per site.")
     else:
-        print(f"\n Coverage: {success_rate:.1%} - Some platforms had issues")
+        print(f"\n⚠️ Coverage: {success_rate:.1%} - Some platforms had issues")
     
     print("\nWhy this approach beats custom scrapers:")
     print("→ Uses content extraction algorithms instead of CSS selectors")
@@ -578,9 +877,9 @@ async def test_assignment_sources():
     
     print("=" * 50)
     print("ASSIGNMENT TEST RESULTS:")
-    print(f" Total items scraped: {len(all_items)}")
-    print(f" Output saved to: {filename}")
-    print(f" Output format: Correct JSON structure")
+    print(f"✓ Total items scraped: {len(all_items)}")
+    print(f"✓ Output saved to: {filename}")
+    print(f"✓ Output format: Correct JSON structure")
     print()
     
     if all_items:
